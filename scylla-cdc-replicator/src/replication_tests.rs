@@ -6,17 +6,18 @@ mod tests {
     use itertools::Itertools;
     use scylla::frame::response::result::CqlValue::{Boolean, Int, Text, UserDefinedType};
     use scylla::frame::response::result::{CqlValue, Row};
-    use scylla::{Session, SessionBuilder};
+    use scylla::Session;
     use scylla_cdc::consumer::{CDCRow, CDCRowSchema, Consumer};
     use std::sync::Arc;
 
-    use scylla_cdc::test_utilities::unique_name;
+    use scylla_cdc::test_utilities::prepare_db;
 
     /// Tuple representing a column in the table that will be replicated.
     /// The first string is the name of the column.
     /// The second string is the name of the type of the column.
     pub type TestColumn<'a> = (&'a str, &'a str);
 
+    #[derive(Clone)]
     pub struct TestTableSchema<'a> {
         name: String,
         partition_key: Vec<TestColumn<'a>>,
@@ -40,120 +41,12 @@ mod tests {
         TimestampsNotMatching(usize, String),
     }
 
-    async fn setup_keyspaces(session: &Session) -> anyhow::Result<(String, String)> {
-        let ks_src = unique_name();
-        let ks_dst = unique_name();
-        session.query(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }}", ks_src), ()).await?;
-        session.query(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }}", ks_dst), ()).await?;
-
-        Ok((ks_src, ks_dst))
-    }
-
-    async fn setup_udts(
-        session: &Session,
-        ks_src: &str,
-        ks_dst: &str,
-        schemas: &[TestUDTSchema<'_>],
-    ) -> anyhow::Result<()> {
-        for udt_schema in schemas {
-            let udt_fields = udt_schema
-                .fields
-                .iter()
-                .map(|(field_name, field_type)| format!("{} {}", field_name, field_type))
-                .join(",");
-            session
-                .query(
-                    format!(
-                        "CREATE TYPE IF NOT EXISTS {}.{} ({})",
-                        ks_src, udt_schema.name, udt_fields
-                    ),
-                    (),
-                )
-                .await?;
-            session
-                .query(
-                    format!(
-                        "CREATE TYPE IF NOT EXISTS {}.{} ({})",
-                        ks_dst, udt_schema.name, udt_fields
-                    ),
-                    (),
-                )
-                .await?;
-        }
-
-        session.refresh_metadata().await?;
-
-        Ok(())
-    }
-
-    async fn setup_tables(
-        session: &Session,
-        ks_src: &str,
-        ks_dst: &str,
-        schema: &TestTableSchema<'_>,
-    ) -> anyhow::Result<()> {
-        let partition_key_name = match schema.partition_key.as_slice() {
-            [pk] => pk.0.to_string(),
-            _ => format!(
-                "({})",
-                schema.partition_key.iter().map(|(name, _)| name).join(",")
-            ),
-        };
-        let create_table_query = format!(
-            "({}, PRIMARY KEY ({}, {}))",
-            schema
-                .partition_key
-                .iter()
-                .chain(schema.clustering_key.iter())
-                .chain(schema.other_columns.iter())
-                .map(|(name, col_type)| format!("{} {}", name, col_type))
-                .join(","),
-            partition_key_name,
-            schema.clustering_key.iter().map(|(name, _)| name).join(",")
-        );
-
-        session
-            .query(
-                format!(
-                    "CREATE TABLE {}.{} {} WITH cdc = {{'enabled' : true}}",
-                    ks_src, schema.name, create_table_query
-                ),
-                (),
-            )
-            .await?;
-        session
-            .query(
-                format!(
-                    "CREATE TABLE {}.{} {}",
-                    ks_dst, schema.name, create_table_query
-                ),
-                (),
-            )
-            .await?;
-
-        session.refresh_metadata().await?;
-
-        Ok(())
-    }
-
-    async fn execute_queries(
-        session: &Session,
-        ks_src: &str,
-        operations: Vec<TestOperation<'_>>,
-    ) -> anyhow::Result<()> {
-        session.use_keyspace(ks_src, false).await?;
-        for operation in operations {
-            session.query(operation, []).await?;
-        }
-
-        Ok(())
-    }
-
     async fn replicate(
         session: &Arc<Session>,
         ks_src: &str,
         ks_dst: &str,
         name: &str,
+        last_read: &mut (u64, i32),
     ) -> anyhow::Result<()> {
         let result = session
             .query(
@@ -183,7 +76,13 @@ mod tests {
         let schema = CDCRowSchema::new(&result.col_specs);
 
         for log in result.rows.unwrap_or_default() {
-            consumer.consume_cdc(CDCRow::from_row(log, &schema)).await?;
+            let cdc_row = CDCRow::from_row(log, &schema);
+            let time = cdc_row.time.to_timestamp().unwrap().to_unix_nanos();
+            let batch_seq_no = cdc_row.batch_seq_no;
+            if (time, batch_seq_no) > *last_read {
+                *last_read = (time, batch_seq_no);
+                consumer.consume_cdc(cdc_row).await?;
+            }
         }
 
         Ok(())
@@ -394,11 +293,10 @@ mod tests {
     /// Function that tests replication process.
     /// Different tests in the same cluster must have different table names.
     async fn test_replication(
-        node_uri: &str,
         schema: TestTableSchema<'_>,
         operations: Vec<TestOperation<'_>>,
     ) -> anyhow::Result<()> {
-        test_replication_with_udt(node_uri, schema, vec![], operations).await?;
+        test_replication_with_udt(schema, vec![], operations).await?;
 
         Ok(())
     }
@@ -406,25 +304,73 @@ mod tests {
     /// Function that tests replication process with a user-defined type
     /// Different tests in the same cluster must have different table names.
     async fn test_replication_with_udt(
-        node_uri: &str,
         table_schema: TestTableSchema<'_>,
         udt_schemas: Vec<TestUDTSchema<'_>>,
         operations: Vec<TestOperation<'_>>,
-    ) -> anyhow::Result<()> {
-        let session = Arc::new(SessionBuilder::new().known_node(node_uri).build().await?);
-        let (ks_src, ks_dst) = setup_keyspaces(&session).await?;
-        setup_udts(&session, &ks_src, &ks_dst, &udt_schemas).await?;
-        setup_tables(&session, &ks_src, &ks_dst, &table_schema).await?;
-        execute_queries(&session, &ks_src, operations).await?;
-        replicate(&session, &ks_src, &ks_dst, &table_schema.name).await?;
-        compare_changes(&session, &ks_src, &ks_dst, &table_schema.name).await?;
-        compare_timestamps(&session, &ks_src, &ks_dst, &table_schema).await?;
+    ) -> anyhow::Result<(Arc<Session>, String, String)> {
+        let mut schema_queries = get_udt_queries(udt_schemas);
+        let create_dst_table_query = get_table_create_query(&table_schema);
+        let create_src_table_query =
+            format!("{} WITH cdc = {{'enabled' : true}}", create_dst_table_query);
 
-        Ok(())
+        let len = schema_queries.len();
+        schema_queries.push(create_src_table_query);
+        let (session, ks_src) = prepare_db(&schema_queries, 1).await?;
+        schema_queries[len] = create_dst_table_query;
+        let (_, ks_dst) = prepare_db(&schema_queries, 1).await?;
+        session.refresh_metadata().await?;
+        let mut last_read = (0, 0);
+
+        for operation in operations {
+            session.query(operation, []).await?;
+            replicate(
+                &session,
+                &ks_src,
+                &ks_dst,
+                &table_schema.name,
+                &mut last_read,
+            )
+            .await?;
+            compare_changes(&session, &ks_src, &ks_dst, &table_schema.name).await?;
+            compare_timestamps(&session, &ks_src, &ks_dst, &table_schema).await?;
+        }
+        Ok((session, ks_src, ks_dst))
     }
 
-    fn get_uri() -> String {
-        std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string())
+    fn get_udt_queries(schemas: Vec<TestUDTSchema<'_>>) -> Vec<String> {
+        schemas
+            .iter()
+            .map(|udt_schema| {
+                let udt_fields = udt_schema
+                    .fields
+                    .iter()
+                    .map(|(field_name, field_type)| format!("{} {}", field_name, field_type))
+                    .join(",");
+                format!("CREATE TYPE {} ({})", udt_schema.name, udt_fields)
+            })
+            .collect()
+    }
+
+    fn get_table_create_query(schema: &TestTableSchema<'_>) -> String {
+        format!(
+            "CREATE TABLE {} ({}, PRIMARY KEY ({}, {}))",
+            schema.name,
+            schema
+                .partition_key
+                .iter()
+                .chain(schema.clustering_key.iter())
+                .chain(schema.other_columns.iter())
+                .map(|(name, col_type)| format!("{} {}", name, col_type))
+                .join(","),
+            match schema.partition_key.as_slice() {
+                [pk] => pk.0.to_string(),
+                _ => format!(
+                    "({})",
+                    schema.partition_key.iter().map(|(name, _)| name).join(",")
+                ),
+            },
+            schema.clustering_key.iter().map(|(name, _)| name).join(",")
+        )
     }
 
     #[tokio::test]
@@ -514,9 +460,7 @@ mod tests {
             "INSERT INTO SIMPLE_INSERT (pk, ck, v1, v2) VALUES (3, 2, 1, false)",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -534,9 +478,7 @@ mod tests {
             "DELETE v1 FROM SIMPLE_UPDATE WHERE pk = 1 AND ck = 2",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -558,7 +500,7 @@ mod tests {
             "UPDATE SIMPLE_UDT_TEST SET ut_col = null WHERE pk = 0 AND ck = 0",
         ];
 
-        test_replication_with_udt(&get_uri(), table_schema, udt_schemas, operations)
+        test_replication_with_udt(table_schema, udt_schemas, operations)
             .await
             .unwrap();
     }
@@ -579,9 +521,7 @@ mod tests {
             "INSERT INTO MAPS_INSERT (pk, ck, v1, v2) VALUES (5, 6, {100: 100, 200: 200, 300: 300}, {400: true, 500: false})",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -599,9 +539,7 @@ mod tests {
             "DELETE v1 FROM MAPS_UPDATE WHERE pk = 1 AND ck = 2",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -620,9 +558,7 @@ mod tests {
             "UPDATE MAP_ELEMENTS_UPDATE SET v1 = v1 - {10} WHERE pk = 10 AND ck = 20",
             "UPDATE MAP_ELEMENTS_UPDATE SET v1 = v1 - {1}, v1 = v1 + {2137: -2137} WHERE pk = 1 AND ck = 2",
         ];
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -643,9 +579,7 @@ mod tests {
             "INSERT INTO ROW_DELETE (pk, ck, v1, v2) VALUES (-1, -2, 30, true)",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -663,9 +597,7 @@ mod tests {
             "INSERT INTO SET_TEST (pk, ck, v) VALUES (3, 4, {1, 1})",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -682,9 +614,7 @@ mod tests {
             "UPDATE SET_TEST SET v = {1, 2} WHERE pk = 0 AND ck = 1",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -701,9 +631,7 @@ mod tests {
             "DELETE v FROM SET_TEST WHERE pk = 0 AND ck = 1",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -722,9 +650,7 @@ mod tests {
             "UPDATE SET_TEST SET v = v - {10}, v = v + {200} WHERE pk = 0 AND ck = 1",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -742,9 +668,7 @@ mod tests {
             "DELETE FROM PARTITION_DELETE WHERE pk = 0",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -767,7 +691,7 @@ mod tests {
             "INSERT INTO TEST_UDT_INSERT (pk, ck, v) VALUES (3, 4, {int_val: 3, bool_val: true})",
         ];
 
-        test_replication_with_udt(&get_uri(), schema, udt_schemas, operations)
+        test_replication_with_udt(schema, udt_schemas, operations)
             .await
             .unwrap();
     }
@@ -787,9 +711,7 @@ mod tests {
             "DELETE FROM PARTITION_DELETE_MULT_PK WHERE pk1 = 0 AND pk2 = 2",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -807,9 +729,7 @@ mod tests {
             "UPDATE LIST_ELEMENTS_UPDATE SET v = v - [1, 5] WHERE pk = 1 AND ck = 2",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -832,7 +752,7 @@ mod tests {
             "UPDATE TEST_UDT_UPDATE SET v = null WHERE pk = 0 AND ck = 1",
         ];
 
-        test_replication_with_udt(&get_uri(), schema, udt_schemas, operations)
+        test_replication_with_udt(schema, udt_schemas, operations)
             .await
             .unwrap();
     }
@@ -851,9 +771,7 @@ mod tests {
             "UPDATE LIST_REPLACE SET v = [2, 4, 6, 8] WHERE pk = 1 AND ck = 2",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -870,28 +788,11 @@ mod tests {
             "UPDATE COMPARE_TIME SET v2 = false WHERE pk = 1 AND ck = 2",
         ];
 
-        let session = Arc::new(
-            SessionBuilder::new()
-                .known_node(&get_uri())
-                .build()
+        let (session, ks_src, ks_dst) =
+            test_replication_with_udt(schema.clone(), vec![], operations)
                 .await
-                .unwrap(),
-        );
-        let (ks_src, ks_dst) = setup_keyspaces(&session).await.unwrap();
-        setup_tables(&session, &ks_src, &ks_dst, &schema)
-            .await
-            .unwrap();
-        execute_queries(&session, &ks_src, operations)
-            .await
-            .unwrap();
+                .unwrap();
 
-        replicate(&session, &ks_src, &ks_dst, &schema.name)
-            .await
-            .unwrap();
-
-        compare_changes(&session, &ks_src, &ks_dst, &schema.name)
-            .await
-            .unwrap();
         // We update timestamps for v2 column in src.
         session
             .query(
@@ -938,9 +839,7 @@ mod tests {
             "DELETE v4 FROM COMPARE_TIME WHERE pk = 4 AND CK = 4",
         ];
 
-        test_replication(&get_uri(), schema, operations)
-            .await
-            .unwrap();
+        test_replication(schema, operations).await.unwrap();
     }
 
     #[tokio::test]
@@ -964,8 +863,33 @@ mod tests {
             "UPDATE TEST_UDT_ELEMENTS_UPDATE SET v.int_val = null, v.bool_val = false WHERE pk = 0 AND ck = 1",
         ];
 
-        test_replication_with_udt(&get_uri(), schema, udt_schemas, operations)
+        test_replication_with_udt(schema, udt_schemas, operations)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_range_delete() {
+        let schema = TestTableSchema {
+            name: "RANGE_DELETE".to_string(),
+            partition_key: vec![("pk1", "int"), ("pk2", "int")],
+            clustering_key: vec![("ck1", "int"), ("ck2", "int"), ("ck3", "int")],
+            other_columns: vec![("v", "int")],
+        };
+
+        let operations = std::iter::repeat(0..5).take(3).multi_cartesian_product().map(|x| {
+            format!("INSERT INTO RANGE_DELETE (pk1, pk2, ck1, ck2, ck3, v) VALUES (0, 0, {}, {}, {}, 0)", x[0], x[1], x[2])
+        }).collect::<Vec<_>>();
+
+        let mut operations: Vec<&str> = operations.iter().map(|x| x.as_str()).collect();
+
+        operations.append(&mut vec![
+            "DELETE FROM RANGE_DELETE WHERE pk1 = 0 AND pk2 = 0 AND ck1 = 0 AND ck2 > -1 AND ck2 < 1",
+            "DELETE FROM RANGE_DELETE WHERE pk1 = 0 AND pk2 = 0 AND ck1 = 1 AND ck2 < 2",
+            "DELETE FROM RANGE_DELETE WHERE pk1 = 0 AND pk2 = 0 AND (ck1, ck2) < (3, 3) AND (ck1, ck2, ck3) > (2, 2, 2)",
+            "DELETE FROM RANGE_DELETE WHERE pk1 = 0 AND pk2 = 0 AND (ck1, ck2, ck3) > (3, 3, 3)",
+        ]);
+
+        test_replication(schema, operations).await.unwrap();
     }
 }

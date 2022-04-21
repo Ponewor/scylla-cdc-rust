@@ -8,15 +8,15 @@ use scylla::frame::value::Timestamp;
 use scylla::Session;
 use tokio::time::sleep;
 
-use crate::cdc_types::StreamID;
+use crate::cdc_types::{StreamID, ToTimestamp};
 use crate::consumer::{CDCRow, CDCRowSchema, Consumer};
 
 pub struct StreamReader {
     session: Arc<Session>,
     stream_id_vec: Vec<StreamID>,
     lower_timestamp: chrono::Duration,
-    window_size: chrono::Duration,
-    safety_interval: chrono::Duration,
+    window_size: time::Duration,
+    safety_interval: time::Duration,
     upper_timestamp: tokio::sync::Mutex<Option<chrono::Duration>>,
     sleep_interval: time::Duration,
 }
@@ -26,8 +26,8 @@ impl StreamReader {
         session: &Arc<Session>,
         stream_ids: Vec<StreamID>,
         start_timestamp: chrono::Duration,
-        window_size: chrono::Duration,
-        safety_interval: chrono::Duration,
+        window_size: time::Duration,
+        safety_interval: time::Duration,
         sleep_interval: time::Duration,
     ) -> StreamReader {
         StreamReader {
@@ -61,15 +61,15 @@ impl StreamReader {
         );
         let query_base = self.session.prepare(query).await?;
         let mut window_begin = self.lower_timestamp;
+        let window_size = chrono::Duration::from_std(self.window_size)?;
+        let safety_interval = chrono::Duration::from_std(self.safety_interval)?;
 
         loop {
-            let now = chrono::Local::now().timestamp_millis();
-
             let window_end = max(
                 window_begin,
                 min(
-                    window_begin + self.window_size,
-                    chrono::Duration::milliseconds(now - self.safety_interval.num_milliseconds()),
+                    window_begin + window_size,
+                    chrono::Local::now().to_timestamp() - safety_interval,
                 ),
             );
 
@@ -111,29 +111,25 @@ impl StreamReader {
 mod tests {
     use async_trait::async_trait;
     use futures::stream::StreamExt;
-    use scylla::batch::Consistency;
     use scylla::query::Query;
-    use scylla::SessionBuilder;
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::test_utilities::unique_name;
+    use crate::test_utilities::{populate_simple_db_with_pk, prepare_simple_db, TEST_TABLE};
 
-    const SECOND_IN_MICRO: i64 = 1_000_000;
-    const SECOND_IN_MILLIS: i64 = 1_000;
-    const TEST_TABLE: &str = "t";
-    const SLEEP_INTERVAL: i64 = SECOND_IN_MILLIS / 10;
-    const WINDOW_SIZE: i64 = SECOND_IN_MILLIS / 10 * 3;
-    const SAFETY_INTERVAL: i64 = SECOND_IN_MILLIS / 10;
-    const START_TIME_DELAY_IN_MILLIS: i64 = 2 * SECOND_IN_MILLIS;
+    const SECOND_IN_MILLIS: u64 = 1_000;
+    const SLEEP_INTERVAL: u64 = SECOND_IN_MILLIS / 10;
+    const WINDOW_SIZE: u64 = SECOND_IN_MILLIS / 10 * 3;
+    const SAFETY_INTERVAL: u64 = SECOND_IN_MILLIS / 10;
+    const START_TIME_DELAY_IN_SECONDS: i64 = 2;
 
     impl StreamReader {
         fn test_new(
             session: &Arc<Session>,
             stream_ids: Vec<StreamID>,
             start_timestamp: chrono::Duration,
-            window_size: chrono::Duration,
-            safety_interval: chrono::Duration,
+            window_size: time::Duration,
+            safety_interval: time::Duration,
             sleep_interval: time::Duration,
         ) -> StreamReader {
             StreamReader {
@@ -151,12 +147,11 @@ mod tests {
     async fn get_test_stream_reader(session: &Arc<Session>) -> anyhow::Result<StreamReader> {
         let stream_id_vec = get_cdc_stream_id(session).await?;
 
-        let start_timestamp: chrono::Duration = chrono::Duration::milliseconds(
-            chrono::Local::now().timestamp_millis() - START_TIME_DELAY_IN_MILLIS,
-        );
-        let sleep_interval: time::Duration = time::Duration::from_millis(SLEEP_INTERVAL as u64);
-        let window_size: chrono::Duration = chrono::Duration::milliseconds(WINDOW_SIZE);
-        let safety_interval: chrono::Duration = chrono::Duration::milliseconds(SAFETY_INTERVAL);
+        let start_timestamp = chrono::Local::now().to_timestamp()
+            - chrono::Duration::seconds(START_TIME_DELAY_IN_SECONDS);
+        let sleep_interval = time::Duration::from_millis(SLEEP_INTERVAL);
+        let window_size = time::Duration::from_millis(WINDOW_SIZE);
+        let safety_interval = time::Duration::from_millis(SAFETY_INTERVAL);
 
         let reader = StreamReader::test_new(
             session,
@@ -168,55 +163,6 @@ mod tests {
         );
 
         Ok(reader)
-    }
-
-    fn get_create_table_query() -> String {
-        format!("CREATE TABLE IF NOT EXISTS {} (pk int, t int, v text, s text, PRIMARY KEY (pk, t)) WITH cdc = {{'enabled':true}};", TEST_TABLE)
-    }
-
-    async fn create_test_db(session: &Arc<Session>) -> anyhow::Result<String> {
-        let ks = unique_name();
-
-        let mut create_keyspace_query = Query::new(format!(
-            "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}};",
-            ks
-        ));
-        create_keyspace_query.set_consistency(Consistency::All);
-
-        session.query(create_keyspace_query, &[]).await?;
-        session.await_schema_agreement().await?;
-        session.use_keyspace(&ks, false).await?;
-
-        // Create test table
-        let create_table_query = get_create_table_query();
-        session.query(create_table_query, &[]).await?;
-        session.await_schema_agreement().await?;
-        Ok(ks)
-    }
-
-    async fn prepare_db() -> anyhow::Result<(Arc<Session>, String)> {
-        let uri = get_uri();
-        let session = SessionBuilder::new().known_node(uri).build().await.unwrap();
-        let shared_session = Arc::new(session);
-
-        let ks = create_test_db(&shared_session).await?;
-        Ok((shared_session, ks))
-    }
-
-    async fn populate_db_with_pk(session: &Arc<Session>, pk: u32) -> anyhow::Result<()> {
-        for i in 0..3 {
-            session
-                .query(
-                    format!(
-                        "INSERT INTO {} (pk, t, v, s) VALUES ({}, {}, 'val{}', 'static{}');",
-                        TEST_TABLE, pk, i, i, i
-                    ),
-                    &[],
-                )
-                .await?;
-        }
-
-        Ok(())
     }
 
     async fn get_cdc_stream_id(session: &Arc<Session>) -> anyhow::Result<Vec<StreamID>> {
@@ -237,10 +183,6 @@ mod tests {
         }
 
         Ok(stream_ids_vec)
-    }
-
-    fn get_uri() -> String {
-        std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string())
     }
 
     type TestResult = (i32, String, i32, String);
@@ -265,23 +207,20 @@ mod tests {
 
     #[tokio::test]
     async fn check_fetch_cdc_with_multiple_stream_id() {
-        let (shared_session, ks) = prepare_db().await.unwrap();
+        let (shared_session, ks) = prepare_simple_db().await.unwrap();
 
         let partition_key_1 = 0;
         let partition_key_2 = 1;
-        populate_db_with_pk(&shared_session, partition_key_1)
+        populate_simple_db_with_pk(&shared_session, partition_key_1)
             .await
             .unwrap();
-        populate_db_with_pk(&shared_session, partition_key_2)
+        populate_simple_db_with_pk(&shared_session, partition_key_2)
             .await
             .unwrap();
 
         let cdc_reader = get_test_stream_reader(&shared_session).await.unwrap();
-        let to_set_upper_timestamp = SECOND_IN_MILLIS;
         cdc_reader
-            .set_upper_timestamp(chrono::Duration::milliseconds(
-                chrono::Local::now().timestamp_millis() + to_set_upper_timestamp,
-            ))
+            .set_upper_timestamp(chrono::Local::now().to_timestamp() + chrono::Duration::seconds(1))
             .await;
         let fetched_rows = Arc::new(Mutex::new(vec![]));
         let consumer = Box::new(FetchTestConsumer {
@@ -324,19 +263,16 @@ mod tests {
 
     #[tokio::test]
     async fn check_fetch_cdc_with_one_stream_id() {
-        let (shared_session, ks) = prepare_db().await.unwrap();
+        let (shared_session, ks) = prepare_simple_db().await.unwrap();
 
         let partition_key = 0;
-        populate_db_with_pk(&shared_session, partition_key)
+        populate_simple_db_with_pk(&shared_session, partition_key)
             .await
             .unwrap();
 
         let cdc_reader = get_test_stream_reader(&shared_session).await.unwrap();
-        let to_set_upper_timestamp = SECOND_IN_MILLIS;
         cdc_reader
-            .set_upper_timestamp(chrono::Duration::milliseconds(
-                chrono::Local::now().timestamp_millis() + to_set_upper_timestamp,
-            ))
+            .set_upper_timestamp(chrono::Local::now().to_timestamp() + chrono::Duration::seconds(1))
             .await;
         let fetched_rows = Arc::new(Mutex::new(vec![]));
         let consumer = Box::new(FetchTestConsumer {
@@ -359,15 +295,15 @@ mod tests {
 
     #[tokio::test]
     async fn check_set_upper_timestamp_in_fetch_cdc() {
-        let (shared_session, ks) = prepare_db().await.unwrap();
+        let (shared_session, ks) = prepare_simple_db().await.unwrap();
 
         let mut insert_before_upper_timestamp_query = Query::new(format!(
             "INSERT INTO {} (pk, t, v, s) VALUES ({}, {}, '{}', '{}');",
             TEST_TABLE, 0, 0, "val0", "static0"
         ));
-        insert_before_upper_timestamp_query.set_timestamp(Some(
-            chrono::Local::now().timestamp_millis() * 1000_i64 - SECOND_IN_MICRO,
-        ));
+        let second_ago = chrono::Local::now() - chrono::Duration::seconds(1);
+        insert_before_upper_timestamp_query
+            .set_timestamp(second_ago.to_timestamp().num_microseconds());
         shared_session
             .query(insert_before_upper_timestamp_query, ())
             .await
@@ -375,18 +311,16 @@ mod tests {
 
         let cdc_reader = get_test_stream_reader(&shared_session).await.unwrap();
         cdc_reader
-            .set_upper_timestamp(chrono::Duration::milliseconds(
-                chrono::Local::now().timestamp_millis(),
-            ))
+            .set_upper_timestamp(chrono::Local::now().to_timestamp())
             .await;
 
         let mut insert_after_upper_timestamp_query = Query::new(format!(
             "INSERT INTO {} (pk, t, v, s) VALUES ({}, {}, '{}', '{}');",
             TEST_TABLE, 0, 1, "val1", "static1"
         ));
-        insert_after_upper_timestamp_query.set_timestamp(Some(
-            chrono::Local::now().timestamp_millis() * 1000_i64 + SECOND_IN_MICRO,
-        ));
+        let second_later = chrono::Local::now() + chrono::Duration::seconds(1);
+        insert_after_upper_timestamp_query
+            .set_timestamp(second_later.to_timestamp().num_microseconds());
         shared_session
             .query(insert_after_upper_timestamp_query, ())
             .await

@@ -187,7 +187,7 @@ impl GenerationFetcher {
         let (generation_sender, generation_receiver) = mpsc::channel(1);
 
         let (future, future_handle) = async move {
-            let generation = loop {
+            let mut generation = loop {
                 match self.fetch_generation_by_timestamp(&start_timestamp).await {
                     Ok(Some(generation)) => break generation,
                     Ok(None) => {
@@ -211,14 +211,14 @@ impl GenerationFetcher {
             }
 
             loop {
-                let generation = loop {
+                generation = loop {
                     match self.fetch_next_generation(&generation).await {
                         Ok(Some(generation)) => break generation,
                         Ok(None) => sleep(sleep_interval).await,
                         _ => warn!("Failed to fetch next generation"),
                     }
                 };
-                if generation_sender.send(generation).await.is_err() {
+                if generation_sender.send(generation.clone()).await.is_err() {
                     break;
                 }
             }
@@ -263,9 +263,7 @@ async fn new_distributed_system_query(stmt: String, session: &Session) -> anyhow
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utilities::unique_name;
-    use scylla::statement::Consistency;
-    use scylla::SessionBuilder;
+    use crate::test_utilities::prepare_db;
 
     use super::*;
 
@@ -315,29 +313,24 @@ mod tests {
         )
     }
 
-    // Creates test keyspace and tables if they don't exist.
-    // Test data was sampled from a local copy of database.
-    async fn create_test_db(session: &Session) {
-        let ks = unique_name();
-        let mut query = Query::new(format!(
-            "CREATE KEYSPACE IF NOT EXISTS {} WITH replication
-                = {{'class':'SimpleStrategy', 'replication_factor': 3}};",
-            ks
-        ));
-        query.set_consistency(Consistency::All);
+    async fn insert_generation_timestamp(session: &Session, generation: i64) {
+        let query = new_distributed_system_query(
+            format!(
+                "INSERT INTO {} (key, time, expired) VALUES ('timestamps', ?, NULL);",
+                TEST_GENERATION_TABLE
+            ),
+            session,
+        )
+        .await
+        .unwrap();
 
-        session.query(query, &[]).await.unwrap();
-        session.await_schema_agreement().await.unwrap();
-        session.use_keyspace(ks, false).await.unwrap();
-
-        // Create test tables containing information about generations and streams.
-        for query in vec![
-            construct_generation_table_query(),
-            construct_stream_table_query(),
-        ] {
-            session.query(query, &[]).await.unwrap();
-        }
-        session.await_schema_agreement().await.unwrap();
+        session
+            .query(
+                query,
+                (Timestamp(chrono::Duration::milliseconds(generation)),),
+            )
+            .await
+            .unwrap();
     }
 
     // Populate test tables with given data.
@@ -346,23 +339,7 @@ mod tests {
             Timestamp(chrono::Duration::milliseconds(GENERATION_NEW_MILLISECONDS));
 
         for generation in &[GENERATION_NEW_MILLISECONDS, GENERATION_OLD_MILLISECONDS] {
-            let query = new_distributed_system_query(
-                format!(
-                    "INSERT INTO {} (key, time, expired) VALUES ('timestamps', ?, NULL);",
-                    TEST_GENERATION_TABLE
-                ),
-                session,
-            )
-            .await
-            .unwrap();
-
-            session
-                .query(
-                    query,
-                    (Timestamp(chrono::Duration::milliseconds(*generation)),),
-                )
-                .await
-                .unwrap();
+            insert_generation_timestamp(session, *generation).await;
         }
 
         let query = new_distributed_system_query(
@@ -380,14 +357,18 @@ mod tests {
 
     // Create setup for tests.
     async fn setup() -> anyhow::Result<GenerationFetcher> {
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
-
-        let session = SessionBuilder::new().known_node(uri).build().await?;
-
-        create_test_db(&session).await;
+        let session = prepare_db(
+            &[
+                construct_generation_table_query(),
+                construct_stream_table_query(),
+            ],
+            3,
+        )
+        .await?
+        .0;
         populate_test_db(&session).await;
 
-        let generation_fetcher = GenerationFetcher::test_new(&Arc::new(session));
+        let generation_fetcher = GenerationFetcher::test_new(&session);
 
         Ok(generation_fetcher)
     }
@@ -512,5 +493,41 @@ mod tests {
             .collect();
 
         assert_eq!(stream_ids, correct_stream_ids);
+    }
+
+    #[tokio::test]
+    async fn test_get_generations_continuously() {
+        let fetcher = setup().await.unwrap();
+        let session = fetcher.session.clone();
+
+        let (mut generation_receiver, _future) = Arc::new(fetcher)
+            .fetch_generations_continuously(
+                chrono::Duration::milliseconds(GENERATION_OLD_MILLISECONDS - 1),
+                time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap();
+
+        let first_gen = GenerationTimestamp {
+            timestamp: chrono::Duration::milliseconds(GENERATION_OLD_MILLISECONDS),
+        };
+
+        let next_gen = GenerationTimestamp {
+            timestamp: chrono::Duration::milliseconds(GENERATION_NEW_MILLISECONDS),
+        };
+
+        let generation = generation_receiver.recv().await.unwrap();
+        assert_eq!(generation, first_gen);
+
+        let generation = generation_receiver.recv().await.unwrap();
+        assert_eq!(generation, next_gen);
+
+        let new_gen = GenerationTimestamp {
+            timestamp: chrono::Duration::milliseconds(GENERATION_NEW_MILLISECONDS + 100),
+        };
+
+        insert_generation_timestamp(&session, GENERATION_NEW_MILLISECONDS + 100).await;
+        let generation = generation_receiver.recv().await.unwrap();
+        assert_eq!(generation, new_gen);
     }
 }

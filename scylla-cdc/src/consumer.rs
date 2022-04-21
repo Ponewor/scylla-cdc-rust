@@ -147,7 +147,7 @@ impl CDCRow<'_> {
             } else if i == schema.batch_seq_no {
                 batch_seq_no = column.unwrap().as_int().unwrap();
             } else if i == schema.end_of_batch {
-                end_of_batch = column.unwrap().as_boolean().unwrap()
+                end_of_batch = column.is_some() && column.unwrap().as_boolean().unwrap()
             } else if i == schema.operation {
                 operation = OperationType::try_from(column.unwrap().as_tinyint().unwrap()).unwrap();
             } else if i == schema.ttl {
@@ -257,14 +257,10 @@ impl CDCRow<'_> {
 
 #[cfg(test)]
 mod tests {
-    // Because we are planning to extract a common setup to all tests,
-    // the setup for this module is based on generation fetcher's tests.
-
     use super::*;
-    use crate::test_utilities::unique_name;
-    use scylla::batch::Consistency;
-    use scylla::query::Query;
-    use scylla::{Session, SessionBuilder};
+    use crate::test_utilities::prepare_db;
+    use scylla::Session;
+    use std::sync::Arc;
     // These tests should be indifferent to things like number of Scylla nodes,
     // so if run separately, they can be tested on one Scylla instance.
 
@@ -325,37 +321,16 @@ mod tests {
             .unwrap();
     }
 
-    // This is copied from stream_generations::tests, because we plan to standardize this.
-    async fn create_test_db(session: &Session) {
-        let ks = unique_name();
-        // These tests don't rely on how the cluster looks like, so we can test on one node.
-        let mut query = Query::new(format!(
-            "CREATE KEYSPACE IF NOT EXISTS {} WITH replication
-                = {{'class':'SimpleStrategy', 'replication_factor': 1}};",
-            ks
-        ));
-        query.set_consistency(Consistency::All);
-
-        session.query(query, &[]).await.unwrap();
-        session.await_schema_agreement().await.unwrap();
-        session.use_keyspace(ks, false).await.unwrap();
-
-        // Create test tables containing sample data for tests.
-        for query in vec![
-            construct_single_value_table_query(),
-            construct_single_collection_table_query(),
-        ] {
-            session.query(query, &[]).await.unwrap();
-        }
-        session.await_schema_agreement().await.unwrap();
-    }
-
-    async fn setup() -> anyhow::Result<Session> {
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
-
-        let session = SessionBuilder::new().known_node(uri).build().await?;
-
-        create_test_db(&session).await;
+    async fn setup() -> anyhow::Result<Arc<Session>> {
+        let session = prepare_db(
+            &[
+                construct_single_value_table_query(),
+                construct_single_collection_table_query(),
+            ],
+            1,
+        )
+        .await?
+        .0;
         populate_single_value_table(&session).await;
         populate_single_collection_table(&session).await;
 
