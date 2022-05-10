@@ -11,7 +11,6 @@ use scylla::prepared_statement::PreparedStatement;
 use scylla::query::Query;
 use scylla::transport::topology::{CollectionType, ColumnKind, CqlType, Table};
 use scylla::Session;
-
 use scylla_cdc::consumer::*;
 
 struct PreparedStatementCache {
