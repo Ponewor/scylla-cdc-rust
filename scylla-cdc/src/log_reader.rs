@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time;
 use std::time::SystemTime;
@@ -9,7 +10,7 @@ use futures::stream::{FusedStream, FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use scylla::Session;
 
-use crate::cdc_types::GenerationTimestamp;
+use crate::cdc_types::{GenerationTimestamp, StreamID};
 use crate::consumer::ConsumerFactory;
 use crate::stream_generations::GenerationFetcher;
 use crate::stream_reader::StreamReader;
@@ -71,6 +72,9 @@ impl CDCReaderWorker {
         let mut had_first_generation: bool = false;
         let mut err: Option<anyhow::Error> = None;
 
+        let mut res;
+        let mut good_stream_id= StreamID::new(Default::default());
+
         loop {
             tokio::select! {
                 Some(evt) = stream_reader_tasks.next(), if !stream_reader_tasks.is_terminated() => {
@@ -100,12 +104,47 @@ impl CDCReaderWorker {
 
             if stream_reader_tasks.is_empty() {
                 if let Some(err) = err {
-                    return Err(err);
+                    res = Err(err);
+                    break;
                 }
 
                 if let Some(generation) = next_generation.take() {
                     if generation.timestamp > self.end_timestamp {
-                        return Ok(());
+                        res = Ok(());
+                        break;
+                    }
+
+                    if self.table_name == "simple_inserts" {
+                        for stream_id in fetcher
+                            .fetch_stream_ids(&generation)
+                            .await?
+                            .iter()
+                            .flatten()
+                        {
+                            let query = format!(
+                                "SELECT * FROM {}.{}_scylla_cdc_log \
+                                WHERE \"cdc$stream_id\" in ?",
+                                self.keyspace, self.table_name
+                            );
+                            let mut rows = self
+                                .session
+                                .query_iter(query, (vec![stream_id], ))
+                                .await
+                                .unwrap();
+                            let rows = rows.collect::<Vec<_>>().await;
+                            if !rows.is_empty() {
+                                eprintln!("keyspace {}", self.keyspace);
+                                eprintln!("table_name {}", self.table_name);
+                                eprintln!("generation {}", generation.timestamp);
+                                eprintln!("stream_id {}", stream_id.clone());
+                                eprintln!("stream_id {:?}", stream_id.clone());
+
+                                eprintln!("start_timestamp {:?}", self.start_timestamp);
+                                eprintln!("generation_timestamp {:?}", generation.timestamp);
+
+                                good_stream_id = stream_id.clone();
+                            }
+                        }
                     }
 
                     self.readers = fetcher
@@ -114,13 +153,17 @@ impl CDCReaderWorker {
                         .iter()
                         .flatten()
                         .map(|stream_id| {
+                            let chosen_one = self.table_name == "simple_inserts" && stream_id.clone() == good_stream_id;
                             Arc::new(StreamReader::new(
                                 &self.session,
                                 vec![stream_id.clone()],
-                                max(self.start_timestamp, generation.timestamp),
+                                // max(self.start_timestamp, generation.timestamp),
+                                self.start_timestamp,
+                                // generation.timestamp,
                                 self.window_size,
                                 self.safety_interval,
                                 self.sleep_interval,
+                                chosen_one,
                             ))
                         })
                         .collect();
@@ -145,10 +188,13 @@ impl CDCReaderWorker {
                     // FIXME: There may be another generation coming in the future with timestamp < end_timestamp
                     // that could have been missed because of earlier fetching failures.
                     // More on this here https://github.com/piodul/scylla-cdc-rust/pull/10#discussion_r826865162
-                    return Ok(());
+                    res = Ok(());
+                    break;
                 }
             }
         }
+
+        return res;
     }
 
     async fn set_upper_timestamp(&self, new_upper_timestamp: chrono::Duration) {

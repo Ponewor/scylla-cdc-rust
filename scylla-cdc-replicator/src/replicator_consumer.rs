@@ -835,7 +835,7 @@ impl Consumer for ReplicatorConsumer {
             OperationType::RowRangeDelInclLeft => self.delete_row_range_left(data, true),
             OperationType::RowRangeDelExclRight => self.delete_row_range_right(data, false).await?,
             OperationType::RowRangeDelInclRight => self.delete_row_range_right(data, true).await?,
-            _ => todo!("This type of operation is not supported yet."),
+            _ => {} ,
         }
 
         Ok(())

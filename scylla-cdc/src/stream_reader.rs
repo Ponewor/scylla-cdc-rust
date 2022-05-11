@@ -4,21 +4,26 @@ use std::time;
 
 use chrono;
 use futures::StreamExt;
+use scylla::frame::response::result::Row;
 use scylla::frame::value::Timestamp;
 use scylla::Session;
+use scylla::transport::errors::QueryError;
 use tokio::time::sleep;
 
 use crate::cdc_types::{StreamID, ToTimestamp};
 use crate::consumer::{CDCRow, CDCRowSchema, Consumer};
+use crate::stream_generations::new_distributed_system_query;
+use crate::test_utilities::unique_name;
 
 pub struct StreamReader {
     session: Arc<Session>,
-    stream_id_vec: Vec<StreamID>,
+    pub stream_id_vec: Vec<StreamID>,
     lower_timestamp: chrono::Duration,
     window_size: time::Duration,
     safety_interval: time::Duration,
     upper_timestamp: tokio::sync::Mutex<Option<chrono::Duration>>,
     sleep_interval: time::Duration,
+    chosen_one: bool,
 }
 
 impl StreamReader {
@@ -29,6 +34,7 @@ impl StreamReader {
         window_size: time::Duration,
         safety_interval: time::Duration,
         sleep_interval: time::Duration,
+        chosen_one: bool
     ) -> StreamReader {
         StreamReader {
             session: session.clone(),
@@ -38,6 +44,7 @@ impl StreamReader {
             safety_interval,
             upper_timestamp: Default::default(),
             sleep_interval,
+            chosen_one,
         }
     }
 
@@ -52,6 +59,62 @@ impl StreamReader {
         table_name: String,
         mut consumer: Box<dyn Consumer>,
     ) -> anyhow::Result<()> {
+
+        if self.chosen_one {
+            eprintln!("I am the chosen one");
+            eprintln!("{}", self.lower_timestamp);
+            eprintln!("{}", table_name);
+            eprintln!("{}", self.stream_id_vec[0]);
+            eprintln!("{:?}", self.stream_id_vec[0]);
+            eprintln!("{}", keyspace);
+            eprintln!("{}", table_name);
+
+            let query = format!(
+                "SELECT * FROM {}.{}_scylla_cdc_log \
+                                WHERE \"cdc$stream_id\" in ?",
+                keyspace, table_name
+            );
+            let rows = self
+                .session
+                .query_iter(query, (self.stream_id_vec.clone(), ))
+                .await
+                .unwrap();
+
+            // let mut rows_stream = self
+            //     .session
+            //     .execute_iter(
+            //         query_base.clone(),
+            //         (
+            //             &self.stream_id_vec,
+            //             Timestamp(window_begin),
+            //             Timestamp(window_end),
+            //         ),
+            //     )
+            //     .await?;
+            //
+            // let schema = CDCRowSchema::new(rows_stream.get_column_specs());
+
+            let schema = CDCRowSchema::new(rows.get_column_specs());
+
+
+            let rowsv = rows.collect::<Vec<_>>().await;
+            if rowsv.is_empty() {
+                eprintln!("teraz pusto")
+            } else {
+                eprintln!("{}", self.stream_id_vec[0]);
+                eprintln!("{}", self.stream_id_vec.len());
+                // eprintln!("{}", self.lower_timestamp);
+                eprintln!("{:?}", self.lower_timestamp);
+            }
+
+            for row in rowsv {
+                let row = row?;
+                let row = CDCRow::from_row(row, &schema);
+                eprintln!("{}", row.time);
+                eprintln!("{:?}", row.time.get_timestamp().unwrap().to_unix());
+            }
+        }
+
         let query = format!(
             "SELECT * FROM {}.{}_scylla_cdc_log \
             WHERE \"cdc$stream_id\" in ? \
@@ -87,7 +150,26 @@ impl StreamReader {
 
             let schema = CDCRowSchema::new(rows_stream.get_column_specs());
 
+            // let rows_stream = rows_stream.collect::<Vec<_>>().await;
+            // if rows_stream.is_empty() {
+            //     panic!("ids empty");
+            // }
+            // for row in rows_stream {
+            //     match row {
+            //         Ok(row) => {
+            //             consumer
+            //                 .consume_cdc(CDCRow::from_row(row, &schema))
+            //                 .await?;
+            //         }
+            //         Err(_) => {
+            //             panic!("there's an error");
+            //         }
+            //     }
+            // }
             while let Some(row) = rows_stream.next().await {
+                if self.chosen_one {
+                    eprintln!("coś znaleźliśmy");
+                }
                 consumer
                     .consume_cdc(CDCRow::from_row(row?, &schema))
                     .await?;
@@ -140,6 +222,7 @@ mod tests {
                 safety_interval,
                 upper_timestamp: Default::default(),
                 sleep_interval,
+                chosen_one: false,
             }
         }
     }

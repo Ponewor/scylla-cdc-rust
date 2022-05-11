@@ -1,3 +1,6 @@
+use std::fmt;
+
+use itertools::Itertools;
 use scylla::cql_to_rust::{FromCqlVal, FromCqlValError};
 use scylla::frame::response::result::CqlValue;
 use scylla::frame::value::{Timestamp, Value, ValueTooBig};
@@ -32,6 +35,16 @@ impl FromCqlVal<CqlValue> for StreamID {
             .ok_or(FromCqlValError::BadCqlType)?
             .to_owned();
         Ok(StreamID { id })
+    }
+}
+
+impl fmt::Display for StreamID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.id.iter().map(|&b| format!("{:x?}", b)).join("")
+        )
     }
 }
 

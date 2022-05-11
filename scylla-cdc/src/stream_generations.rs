@@ -254,7 +254,7 @@ async fn select_consistency(session: &Session, query: &mut Query) -> anyhow::Res
     Ok(())
 }
 
-async fn new_distributed_system_query(stmt: String, session: &Session) -> anyhow::Result<Query> {
+pub async fn new_distributed_system_query(stmt: String, session: &Session) -> anyhow::Result<Query> {
     let mut query = Query::new(stmt);
     select_consistency(session, &mut query).await?;
 
